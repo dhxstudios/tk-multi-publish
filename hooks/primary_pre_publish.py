@@ -87,6 +87,8 @@ class PrimaryPrePublishHook(Hook):
             return self._do_softimage_pre_publish(task, work_template, progress_cb, user_data)
         elif engine_name == "tk-photoshopcc":
             return self._do_photoshop_pre_publish(task, work_template, progress_cb, user_data)
+        elif engine_name == "tk-animatecc":
+            return self._do_animate_pre_publish(task, work_template, progress_cb, user_data)
         elif engine_name == "tk-photoshop":
             return self._do_legacy_photoshop_pre_publish(task, work_template, progress_cb, user_data)
         elif engine_name == "tk-mari":
@@ -388,6 +390,45 @@ class PrimaryPrePublishHook(Hook):
 
         progress_cb(100)
 
+        return scene_errors
+
+    def _do_animate_pre_publish(self, task, work_template, progress_cb, user_data):
+        """
+        Do Photoshop primary pre-publish/scene validation
+
+        :param task:            The primary task to pre-publish
+        :param work_template:   The primary work template to use
+        :param progress_cb:     A callback to use when reporting any progress
+                                to the UI
+        :param user_data:       A dictionary containing any data shared by other hooks run prior to
+                                this hook. Additional data may be added to this dictionary that will
+                                then be accessible from user_data in any hooks run after this one.
+
+        :returns:               A list of any errors or problems that were found
+                                during pre-publish
+        """
+        adobe = self.parent.engine.adobe
+
+        progress_cb(0.0, "Validating current scene", task)
+
+        scene_file = adobe.rpc_eval("fl.getDocumentDOM().pathURI;")
+
+        if isinstance(scene_file, unicode):
+            scene_file = scene_file.encode("utf-8")
+            
+        scene_file = str.replace(scene_file, "///", "")
+        scene_file = str.replace(scene_file, "file:", "")
+        scene_file = str.replace(scene_file, "/", "\\")
+        scene_file = str.replace(scene_file, "|", ":")
+
+        if not scene_file:
+            return ["Unable to determine the active document's file path!"]
+            
+        # validate it:
+        scene_errors = self._validate_work_file(scene_file, work_template, task["output"], progress_cb)
+        
+        progress_cb(100)
+          
         return scene_errors
 
     def _do_photoshop_pre_publish(self, task, work_template, progress_cb, user_data):

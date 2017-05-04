@@ -110,6 +110,8 @@ class PrimaryPublishHook(Hook):
             return self._do_houdini_publish(*args)
         elif engine_name == "tk-softimage":
             return self._do_softimage_publish(*args)
+        elif engine_name == "tk-animatecc":
+            return self._do_animate_publish(*args)
         elif engine_name == "tk-photoshopcc":
             return self._do_photoshop_publish(*args)
         elif engine_name == "tk-photoshop":
@@ -915,6 +917,142 @@ class PrimaryPublishHook(Hook):
         """
         # initial implementation does nothing!
         return []
+
+    def _do_animate_publish(
+        self, task, work_template, comment, thumbnail_path, sg_task,
+        progress_cb, user_data
+    ):
+        """
+        Publish the main Animate scene
+
+        :param task:            The primary task to publish
+        :param work_template:   The primary work template to use
+        :param comment:         The publish description/comment
+        :param thumbnail_path:  The path to the thumbnail to associate with the published file
+        :param sg_task:         The Shotgun task that this publish should be associated with
+        :param progress_cb:     A callback to use when reporting any progress
+                                to the UI
+        :param user_data:       A dictionary containing any data shared by other hooks run prior to
+                                this hook. Additional data may be added to this dictionary that will
+                                then be accessible from user_data in any hooks run after this one.
+
+        :returns:               The path to the file that has been published        
+        """
+        adobe = self.parent.engine.adobe
+
+        try:
+            doc = adobe.app.activeDocument
+        except RuntimeError:
+            raise TankError("There is no active document!")
+                
+        # get scene path
+        try:
+            scene_path = adobe.rpc_eval("fl.getDocumentDOM().pathURI;")
+
+            if isinstance(scene_path, unicode):
+                scene_path = scene_path.encode("utf-8")
+                
+            scene_path = str.replace(scene_path, "///", "")
+            scene_path = str.replace(scene_path, "file:", "")
+            scene_path = str.replace(scene_path, "/", "\\")
+            scene_path = str.replace(scene_path, "|", ":")
+        except RuntimeError:
+            raise TankError("The active document has not been saved!")
+        
+        if not work_template.validate(scene_path):
+            raise TankError("File '%s' is not a valid work path, unable to publish!" % scene_path)
+        
+        # use templates to convert to publish path:
+        output = task["output"]
+        fields = work_template.get_fields(scene_path)
+        fields["TankType"] = output["tank_type"]
+        publish_template = output["publish_template"]
+        publish_path = publish_template.apply_fields(fields)
+        
+        if os.path.exists(publish_path):
+            raise TankError("The published file named '%s' already exists!" % publish_path)
+        
+        # save the scene:
+        progress_cb(0.0, "Saving the scene")
+        self.parent.log_debug("Saving the scene...")
+
+        adobe.save_as(scene_path)
+        
+        # copy the file:
+        progress_cb(25.0, "Copying the file")
+        try:
+            publish_folder = os.path.dirname(publish_path)
+            self.parent.ensure_folder_exists(publish_folder)
+            self.parent.log_debug("Copying %s --> %s..." % (scene_path, publish_path))
+            self.parent.copy_file(scene_path, publish_path, task)
+        except Exception, e:
+            raise TankError("Failed to copy file from %s to %s - %s" % (scene_path, publish_path, e))
+
+        # work out publish name:
+        publish_name = self._get_publish_name(publish_path, publish_template, fields)
+
+        # finally, register the publish:
+        progress_cb(50.0, "Registering the publish")
+        tank_publish = self._register_publish(publish_path, 
+                                              publish_name, 
+                                              sg_task, 
+                                              fields["version"], 
+                                              output["tank_type"],
+                                              comment,
+                                              thumbnail_path, 
+                                              dependency_paths=[])
+        
+        #################################################################################
+        # create a version!
+        
+        png_pub_path = os.path.join(tempfile.gettempdir(), "%s_sgtk.png" % uuid.uuid4().hex)
+        
+        thumb_path = str.replace(png_pub_path, "\\", "/")
+        thumb_path = str.replace(thumb_path, ":", "|")
+
+        if 'file:' not in thumb_path:
+            thumb_path = "file:///%s" % thumb_path
+
+        adobe.rpc_eval("fl.getDocumentDOM().exportPNG(\"%s\", true, true);" % thumb_path)
+        
+        # then register version
+        progress_cb(60.0, "Creating Version...")
+        ctx = self.parent.context
+        data = {
+            "user": ctx.user,
+            "description": comment,
+            "sg_first_frame": 1,
+            "frame_count": 1,
+            "frame_range": "1-1",
+            "sg_last_frame": 1,
+            "entity": ctx.entity,
+            "sg_path_to_frames": publish_path,
+            "project": ctx.project,
+            "sg_task": sg_task,
+            "code": tank_publish["code"],
+            "created_by": ctx.user,
+        }
+        
+        if tank.util.get_published_file_entity_type(self.parent.tank) == "PublishedFile":
+            data["published_files"] = [tank_publish]
+        else:# == "TankPublishedFile"
+            data["tank_published_file"] = tank_publish
+        
+        version = self.parent.shotgun.create("Version", data)
+        
+        # upload jpeg
+        progress_cb(70.0, "Uploading to Shotgun...")
+        self.parent.shotgun.upload("Version", version['id'], png_pub_path, "sg_uploaded_movie" )
+
+        try:
+            os.remove(png_pub_path)
+        except:
+            pass
+        
+        progress_cb(100)
+        
+        return publish_path
+
 
     def _do_photoshop_publish(
         self, task, work_template, comment, thumbnail_path, sg_task,
